@@ -1,4 +1,4 @@
-package com.fortyninefold.relay
+package com.fortyninemaps.relay
 
 import cats.implicits._
 import com.monovore.decline.{CommandApp, Opts}
