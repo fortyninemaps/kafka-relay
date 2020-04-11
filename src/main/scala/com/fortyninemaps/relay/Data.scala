@@ -70,6 +70,10 @@ object Data {
   // Sequence of messages ordered by data offset. Messages with offsets <= deleted have been pruned
   case class PartitionState(messages: Vector[Message], deleted: Long)
   object PartitionState {
+    val empty: PartitionState = PartitionState(Vector.empty, 0L)
+
+    def of(message: Message): PartitionState = PartitionState(Vector(message), 0L)
+
     @tailrec
     def mergeMessages(left: Vector[Message], right: Vector[Message]): Vector[Message] =
       if (left.isEmpty) right

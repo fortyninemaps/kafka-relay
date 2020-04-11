@@ -1,5 +1,6 @@
 package com.fortyninemaps.relay
 
+import java.time.Instant
 import java.util.concurrent.atomic.AtomicReference
 
 import com.fortyninemaps.relay.Data.{Coord, Message, MessageState, PartitionState}
@@ -7,6 +8,7 @@ import com.fortyninemaps.relay.LogData.{LogAcknowledged, LogCommitted, LogMessag
 import org.apache.kafka.clients.consumer.{ConsumerRecord, KafkaConsumer, OffsetAndMetadata}
 import org.apache.kafka.common.TopicPartition
 
+import scala.annotation.tailrec
 import scala.jdk.CollectionConverters._
 import scala.concurrent.{ExecutionContext, Future}
 import scala.util.{Failure, Success, Try}
@@ -16,29 +18,21 @@ object Consumer {
   type BytesConsumer = KafkaConsumer[Array[Byte], Array[Byte]]
   type BytesRecord = ConsumerRecord[Array[Byte], Array[Byte]]
 
-  val PollTimeout: java.time.Duration = ???
-  val PerPartitionAvailableTarget: Int = ???
-  val PerPartitionAvailableMinimum: Int = ???
+  val PollTimeout: java.time.Duration = java.time.Duration.ofMillis(500)
+  val PerPartitionAvailableTarget: Int = 1000
+  val PerPartitionAvailableMinimum: Int = 500
   val LogTopics: Set[String] = Set("relay.log")
 
   private def deserializeLogMessage(rec: ConsumerRecord[Array[Byte], Array[Byte]]): Try[LogMessage] = ???
 
   // Insert a message into the internal state vector, potentially overwriting a previous version
-  // FIXME: this is a linear scan, but we could bisect
-  private def insertMessage(msg: Message)(partitionState: PartitionState): PartitionState =
-    partitionState.messages.partition(_.dataOffset < msg.dataOffset) match {
-      case (before, after) if after.isEmpty =>
-        PartitionState(before :+ msg, partitionState.deleted)
-      case (before, after) if after.headOption.exists(_.dataOffset == msg.dataOffset) =>
-        PartitionState(before ++ after.updated(0, msg), partitionState.deleted)
-      case (before, after) =>
-        PartitionState((before :+ msg) ++ after, partitionState.deleted)
-    }
+  private[relay] def insertMessage(message: Message)(partitionState: PartitionState): PartitionState =
+    PartitionState.merge(partitionState, PartitionState.of(message))
 
   // Trim all committed messages from the internal state vector while committing to Kafka
   private def prune(state: Map[TopicPartition, PartitionState]): (Map[TopicPartition, PartitionState], Map[TopicPartition, OffsetAndMetadata]) =
     state.foldLeft((Map.empty[TopicPartition, PartitionState], Map.empty[TopicPartition, OffsetAndMetadata])) {
-      case ((totalState, offsets), (partition, partitionState)) => {
+      case ((totalState, offsets), (partition, partitionState)) =>
         val pruneBefore = partitionState.messages.indexWhere(_.state != MessageState.Committed)
         if (pruneBefore == 0)
           (totalState + (partition -> partitionState), offsets)
@@ -54,9 +48,11 @@ object Consumer {
             (totalState + (partition -> PartitionState(prunedMessages, deleted = newDeletionMarker)), offsets)
           }
         }
-      }
     }
 
+  // Given an iterator of log messages, update the state map with messages that have been sent, acknowledged, and
+  // committed.
+  // FIXME: why do we need to log commits, since they happen in this loop?
   private def updateState(state: Map[TopicPartition, PartitionState], records: Iterator[BytesRecord]): Map[TopicPartition, PartitionState] =
     records.foldLeft(state) {
       case (st, record) => deserializeLogMessage(record) match {
@@ -100,7 +96,25 @@ object Consumer {
       }
     }
 
-  private def insertRecords(state: Map[TopicPartition, PartitionState], records: Iterator[BytesRecord]): Map[TopicPartition, PartitionState] = ???
+  // Given an iterator of messages, update the state map by inserting them as ready to send
+  // Nota bene: a new message is represented as having a Bottom timeout and a zero epoch
+  @tailrec
+  private def insertRecords(state: Map[TopicPartition, PartitionState], records: List[BytesRecord]): Map[TopicPartition, PartitionState] =
+    records match {
+      case Nil => state
+      case hd :: tail =>
+        val tp = new TopicPartition(hd.topic(), hd.partition())
+        val message = Message(
+          state = MessageState.Pending(Instant.MIN, Some(hd), 0),
+          dataOffset = hd.offset(),
+          latestLog = Coord("", 0, 0L) // FIXME: hack because there is no log
+        )
+        val prev = state.getOrElse(tp, PartitionState.empty)
+        insertRecords(
+          state = state.updated(key = tp, value = insertMessage(message)(prev)),
+          tail
+        )
+    }
 
   def iterate(
     consumer: BytesConsumer,
@@ -109,23 +123,32 @@ object Consumer {
   )(implicit ec: ExecutionContext): Future[Unit] = Future {
     val records = consumer.poll(PollTimeout)
     val (logRecords, dataRecords) = records.iterator().asScala.partition(p => LogTopics(p.topic()))
-    val updated = updateState(state, logRecords)
-    val withRecords = insertRecords(updated, dataRecords)
+    val mkNewState = { updateState(_, logRecords) } andThen { insertRecords(_, dataRecords.toList) }
+    val updatedState = mkNewState(state)
 
-    // Try to prune state and commit
-    val (pruned, commits) = prune(withRecords)
+    // Decide what can be committed, and the state we'd have if we did so
+    val (prunedState, commits) = prune(updatedState)
+
+    // Try to commit, but if we fail, stick with the non-pruned state
+    val newState = if (commits.nonEmpty)
+      Try(consumer.commitSync(commits.asJava)).map(_ => prunedState).getOrElse(updatedState)
+    else prunedState
 
     // Update reference to state so that server can merge from it
-    stateRef.set(pruned)
+    stateRef.set(newState)
 
-    if (commits.nonEmpty)
-      consumer.commitSync(commits.asJava)
-
-    // Pause and resume partitions
-    val availableByPartition: Map[TopicPartition, Int] = ???
+    // Pause and resume partitions based on the number of messages in each data partition that are available to send
+    val now = Instant.now
+    val availableByPartition: Map[TopicPartition, Int] =
+      newState.map { case (topicPartition: TopicPartition, partitionState: PartitionState) =>
+        topicPartition -> partitionState.messages.map(_.state).count {
+          case MessageState.Pending(timeout, _, _) if timeout.isBefore(now) => true
+          case _ => false
+        }
+      }
     consumer.pause(availableByPartition.filter(_._2 > PerPartitionAvailableTarget).keys.toSeq.asJava)
     consumer.resume(availableByPartition.filter(_._2 <= PerPartitionAvailableMinimum).keys.toSeq.asJava)
 
-    pruned
+    newState
   }.flatMap(iterate(consumer, _, stateRef))
 }

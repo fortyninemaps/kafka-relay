@@ -48,10 +48,12 @@ object Relay {
     consumer.subscribe((Consumer.LogTopics ++ inputTopics).asJava, new RebalanceListener)
     // TODO: pause data topics
 
-    // Start polling and serving requests
+    // The poller reads from data and log topics. It updates a reference to its internal state, which
+    // the server uses to choose messages to serve.
     val ref = new AtomicReference(Map.empty[TopicPartition, PartitionState])
     Consumer.iterate(consumer, Map.empty, ref)(ExecutionContext.global)
 
+    // The server serves messages to clients and frequently merges the poller's state into its own state.
     serve(port, ref)
   }
 
