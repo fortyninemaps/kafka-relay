@@ -1,10 +1,12 @@
 package com.fortyninemaps.relay
 
+import java.nio.charset.Charset
 import java.time.Instant
 import java.util.concurrent.atomic.AtomicReference
 
 import com.fortyninemaps.relay.Data.{Coord, Message, MessageState, PartitionState}
 import com.fortyninemaps.relay.LogData.{LogAcknowledged, LogCommitted, LogMessage, LogPending}
+import io.circe.parser.decode
 import org.apache.kafka.clients.consumer.{ConsumerRecord, KafkaConsumer, OffsetAndMetadata}
 import org.apache.kafka.common.TopicPartition
 
@@ -23,7 +25,8 @@ object Consumer {
   val PerPartitionAvailableMinimum: Int = 500
   val LogTopics: Set[String] = Set("relay.log")
 
-  private def deserializeLogMessage(rec: ConsumerRecord[Array[Byte], Array[Byte]]): Try[LogMessage] = ???
+  private def deserializeLogMessage(rec: ConsumerRecord[Array[Byte], Array[Byte]]): Try[LogMessage] =
+    decode[LogMessage](new String(rec.value(), Charset.forName("UTF-8"))).toTry
 
   // Insert a message into the internal state vector, potentially overwriting a previous version
   private[relay] def insertMessage(message: Message)(partitionState: PartitionState): PartitionState =
@@ -52,7 +55,6 @@ object Consumer {
 
   // Given an iterator of log messages, update the state map with messages that have been sent, acknowledged, and
   // committed.
-  // FIXME: why do we need to log commits, since they happen in this loop?
   private def updateState(state: Map[TopicPartition, PartitionState], records: Iterator[BytesRecord]): Map[TopicPartition, PartitionState] =
     records.foldLeft(state) {
       case (st, record) => deserializeLogMessage(record) match {

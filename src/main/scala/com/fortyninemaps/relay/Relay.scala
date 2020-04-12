@@ -4,6 +4,10 @@ import java.time.Instant
 import java.util
 import java.util.concurrent.atomic.AtomicReference
 
+import cats.syntax.functor._
+import io.circe.{Decoder, Encoder}
+import io.circe.generic.semiauto.{deriveDecoder, deriveEncoder}
+import io.circe.syntax._
 import org.apache.kafka.clients.consumer.{ConsumerRebalanceListener, KafkaConsumer}
 import org.apache.kafka.common.TopicPartition
 
@@ -28,6 +32,25 @@ object LogData {
   case class LogAcknowledged(coord: Coord) extends LogMessage
   // Means that the given offset has been committed in the data partition
   case class LogCommitted(coord: Coord) extends LogMessage
+
+  implicit val pendingDecoder: Decoder[LogPending] = deriveDecoder
+  implicit val pendingEncoder: Encoder[LogPending] = deriveEncoder
+  implicit val acknowledgedDecoder: Decoder[LogAcknowledged] = deriveDecoder
+  implicit val acknowledgedEncoder: Encoder[LogAcknowledged] = deriveEncoder
+  implicit val committedDecoder: Decoder[LogCommitted] = deriveDecoder
+  implicit val committedEncoder: Encoder[LogCommitted] = deriveEncoder
+
+  implicit val logDecoder: Decoder[LogMessage] = List[Decoder[LogMessage]](
+    Decoder[LogPending].widen,
+    Decoder[LogAcknowledged].widen,
+    Decoder[LogCommitted].widen
+  ).reduceLeft(_ or _)
+
+  implicit val logEncoder: Encoder[LogMessage] = Encoder.instance {
+    case pending @ LogPending(_, _, _) => pending.asJson
+    case acknowledged @ LogAcknowledged(_) => acknowledged.asJson
+    case committed @ LogCommitted(_) => committed.asJson
+  }
 }
 
 object Relay {

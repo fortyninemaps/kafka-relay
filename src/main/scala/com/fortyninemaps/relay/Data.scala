@@ -2,6 +2,8 @@ package com.fortyninemaps.relay
 
 import java.time.Instant
 
+import io.circe.{Decoder, Encoder}
+import io.circe.generic.semiauto.{deriveDecoder, deriveEncoder}
 import org.apache.kafka.clients.consumer.{ConsumerRecord, OffsetAndMetadata}
 import org.apache.kafka.common.TopicPartition
 
@@ -19,6 +21,9 @@ object Data {
 
     def merge(left: Coord, right: Coord): Coord =
       if (left.offset < right.offset) right else left
+
+    implicit val coordDecoder: Decoder[Coord] = deriveDecoder
+    implicit val coordEncoder: Encoder[Coord] = deriveEncoder
   }
 
   def mergeOpt[T](left: Option[T], right: Option[T]): Option[T] =
